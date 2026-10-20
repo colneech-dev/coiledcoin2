@@ -9,6 +9,7 @@
 #include <test/util/common.h>
 #include <test/util/setup_common.h>
 #include <util/chaintype.h>
+#include <validation.h>
 
 #include <boost/test/unit_test.hpp>
 
@@ -176,6 +177,10 @@ void sanity_check_chainparams(const ArgsManager& args, ChainType chain_type)
     BOOST_CHECK(!over);
     BOOST_CHECK(UintToArith256(consensus.powLimit) >= pow_compact);
 
+    // headers sync needs non-zero parameters, or HeadersSyncState asserts when a peer triggers presync
+    BOOST_CHECK_GT(chainParams->HeadersSync().commitment_period, 0U);
+    BOOST_CHECK_GT(chainParams->HeadersSync().redownload_buffer_size, 0U);
+
     // check max target * 4*nPowTargetTimespan doesn't overflow -- see pow.cpp:CalculateNextWorkRequired()
     if (!consensus.fPowNoRetargeting) {
         arith_uint256 targ_max{UintToArith256(uint256{"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"})};
@@ -207,6 +212,30 @@ BOOST_AUTO_TEST_CASE(ChainParams_TESTNET4_sanity)
 BOOST_AUTO_TEST_CASE(ChainParams_SIGNET_sanity)
 {
     sanity_check_chainparams(*m_node.args, ChainType::SIGNET);
+}
+
+BOOST_AUTO_TEST_CASE(block_subsidy_main)
+{
+    const auto params = CreateChainParams(*m_node.args, ChainType::MAIN);
+    const auto& c = params->GetConsensus();
+
+    // Block 1 pays exactly the declared premine
+    BOOST_CHECK_EQUAL(GetBlockSubsidy(1, c), 26000 * COIN);
+    // Slow start: linear ramp over the first nSlowStartBlocks blocks
+    BOOST_CHECK_EQUAL(GetBlockSubsidy(0, c), 0);
+    BOOST_CHECK_EQUAL(GetBlockSubsidy(2, c), 2 * (20 * COIN / 1440));
+    BOOST_CHECK_EQUAL(GetBlockSubsidy(720, c), 720 * (20 * COIN / 1440));
+    BOOST_CHECK_EQUAL(GetBlockSubsidy(1439, c), 1439 * (20 * COIN / 1440));
+    BOOST_CHECK_EQUAL(GetBlockSubsidy(1440, c), 20 * COIN);
+    // Halvings every 525,000 blocks
+    BOOST_CHECK_EQUAL(GetBlockSubsidy(524999, c), 20 * COIN);
+    BOOST_CHECK_EQUAL(GetBlockSubsidy(525000, c), 10 * COIN);
+    BOOST_CHECK_EQUAL(GetBlockSubsidy(2 * 525000, c), 5 * COIN);
+    BOOST_CHECK_EQUAL(GetBlockSubsidy(3 * 525000, c), COIN * 5 / 2);
+    BOOST_CHECK_EQUAL(GetBlockSubsidy(4 * 525000, c), COIN * 5 / 4);
+    // Tail emission: never below 1 CLC2, even after the shift would reach zero
+    BOOST_CHECK_EQUAL(GetBlockSubsidy(5 * 525000, c), COIN);
+    BOOST_CHECK_EQUAL(GetBlockSubsidy(70 * 525000, c), COIN);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
