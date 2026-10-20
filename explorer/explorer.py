@@ -2,7 +2,8 @@
 """CoiledCoin II block explorer.
 
 Single-file, standard-library-only web app that reads a local coiledcoin2d over
-JSON-RPC and serves server-rendered pages. See README.md.
+JSON-RPC, keeps a SQLite address index, and serves HTML pages plus a JSON API.
+See README.md.
 """
 import argparse
 import base64
@@ -10,6 +11,7 @@ import html
 import json
 import os
 import re
+import sqlite3
 import sys
 import threading
 import time
@@ -73,6 +75,116 @@ class TtlCache:
         return value
 
 
+# ---------------------------------------------------------------- address index
+
+SATS = Decimal(100000000)
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS blocks(height INTEGER PRIMARY KEY, hash TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS txio(address TEXT NOT NULL, height INTEGER NOT NULL, txid TEXT NOT NULL, delta INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS txio_addr ON txio(address, height DESC);
+CREATE INDEX IF NOT EXISTS txio_height ON txio(height);
+CREATE TABLE IF NOT EXISTS balances(address TEXT PRIMARY KEY, balance INTEGER NOT NULL, txs INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS balances_bal ON balances(balance DESC);
+"""
+
+
+def sats(v):
+    return int((Decimal(v) * SATS).to_integral_value())
+
+
+def from_sats(n):
+    return Decimal(n) / SATS
+
+
+def open_db(path):
+    conn = sqlite3.connect(path, timeout=60)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.executescript(SCHEMA)
+    return conn
+
+
+class Indexer:
+    """Follows the node's best chain and records per-address net balance changes.
+
+    Uses getblock verbosity 3 (inputs carry their prevout), so the node must keep undo data (not pruned).
+    Handles reorgs by rolling back stored blocks until the stored hash matches the node's chain.
+    """
+
+    def __init__(self, rpc, path):
+        self.rpc = rpc
+        self.path = path
+        self.indexed_height = -1
+        self.node_height = 0
+
+    @staticmethod
+    def block_deltas(blk):
+        deltas = {}
+        for tx in blk["tx"]:
+            for vin in tx["vin"]:
+                prev = vin.get("prevout")
+                if prev and "address" in prev["scriptPubKey"]:
+                    key = (prev["scriptPubKey"]["address"], tx["txid"])
+                    deltas[key] = deltas.get(key, 0) - sats(prev["value"])
+            for vout in tx["vout"]:
+                if "address" in vout["scriptPubKey"]:
+                    key = (vout["scriptPubKey"]["address"], tx["txid"])
+                    deltas[key] = deltas.get(key, 0) + sats(vout["value"])
+        return deltas
+
+    def add_block(self, conn, blk):
+        with conn:
+            for (addr, txid), delta in self.block_deltas(blk).items():
+                conn.execute("INSERT INTO txio VALUES(?,?,?,?)", (addr, blk["height"], txid, delta))
+                conn.execute("INSERT INTO balances VALUES(?,?,1) ON CONFLICT(address) DO UPDATE SET "
+                             "balance=balance+excluded.balance, txs=txs+1", (addr, delta))
+            conn.execute("INSERT INTO blocks VALUES(?,?)", (blk["height"], blk["hash"]))
+
+    def rollback(self, conn):
+        """Remove stored blocks that are no longer on the node's best chain."""
+        while True:
+            row = conn.execute("SELECT height, hash FROM blocks ORDER BY height DESC LIMIT 1").fetchone()
+            if not row:
+                return
+            try:
+                if self.rpc.call("getblockhash", row[0]) == row[1]:
+                    return
+            except RpcError:
+                pass  # stored height is beyond the node's chain
+            sys.stderr.write("index: rolling back block %d\n" % row[0])
+            with conn:
+                conn.execute("UPDATE balances SET balance=balance-(SELECT SUM(delta) FROM txio WHERE address=balances.address AND height=?), "
+                             "txs=txs-(SELECT COUNT(*) FROM txio WHERE address=balances.address AND height=?) "
+                             "WHERE address IN (SELECT address FROM txio WHERE height=?)", (row[0], row[0], row[0]))
+                conn.execute("DELETE FROM txio WHERE height=?", (row[0],))
+                conn.execute("DELETE FROM blocks WHERE height=?", (row[0],))
+
+    def step(self, conn):
+        self.rollback(conn)
+        row = conn.execute("SELECT height, hash FROM blocks ORDER BY height DESC LIMIT 1").fetchone()
+        last_height, last_hash = row if row else (-1, None)
+        self.indexed_height = last_height
+        self.node_height = self.rpc.call("getblockcount")
+        for h in range(last_height + 1, self.node_height + 1):
+            blk = self.rpc.call("getblock", self.rpc.call("getblockhash", h), 3)
+            if last_hash is not None and blk.get("previousblockhash") != last_hash:
+                return  # reorg while indexing; next step rolls back
+            self.add_block(conn, blk)
+            last_hash = blk["hash"]
+            self.indexed_height = h
+
+    def run(self):
+        conn = open_db(self.path)
+        while True:
+            try:
+                self.step(conn)
+            except Exception as e:
+                sys.stderr.write("index: %r (retrying)\n" % (e,))
+            time.sleep(5)
+
+    def start(self):
+        threading.Thread(target=self.run, daemon=True, name="indexer").start()
+
+
 # ---------------------------------------------------------------- formatting
 
 def esc(s):
@@ -128,7 +240,7 @@ a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
 header{background:var(--card);border-bottom:1px solid var(--line)}
 .wrap{max-width:1000px;margin:0 auto;padding:0 16px}
 .bar{display:flex;gap:16px;align-items:center;flex-wrap:wrap;padding:12px 0}
-.bar .brand{font-weight:700;font-size:18px;color:var(--fg)}
+.bar .brand{font-weight:700;font-size:18px;color:var(--fg)}.bar>a:not(.brand){color:var(--mut)}
 .bar form{flex:1;min-width:220px;display:flex;gap:8px}
 input[type=text]{flex:1;padding:8px 10px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);font:inherit}
 button{padding:8px 14px;border:0;border-radius:6px;background:var(--acc);color:#fff;font:inherit;cursor:pointer}
@@ -155,7 +267,7 @@ def page(title, body, q=""):
     return """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>%s · CoiledCoin II Explorer</title>
 <style>%s</style></head><body>
-<header><div class="wrap bar"><a class="brand" href="/">CoiledCoin II Explorer</a>
+<header><div class="wrap bar"><a class="brand" href="/">CoiledCoin II Explorer</a><a href="/mempool">Mempool</a><a href="/richlist">Richlist</a>
 <form action="/search" method="get"><input type="text" name="q" value="%s" placeholder="Block height, block hash, txid or address" autocomplete="off"><button>Search</button></form>
 </div></header><main class="wrap">%s</main>
 <footer class="wrap">CoiledCoin II (%s) · merge-mined with Bitcoin, chain ID 16</footer></body></html>""" % (esc(title), STYLE, esc(q), body, TICKER)
@@ -168,10 +280,20 @@ def kv(rows):
 # ---------------------------------------------------------------- pages
 
 class Explorer:
-    def __init__(self, rpc):
+    def __init__(self, rpc, indexer):
         self.rpc = rpc
+        self.indexer = indexer
         self.cache = TtlCache()
-        self.scan_lock = threading.Lock()
+
+    def db(self):
+        return open_db(self.indexer.path)
+
+    def index_note(self):
+        i = self.indexer
+        if i.indexed_height >= i.node_height:
+            return ""
+        return '<p class=mut>Address index is catching up: block %s of %s. Balances and history may be incomplete.</p>' % (
+            "{:,}".format(max(i.indexed_height, 0)), "{:,}".format(i.node_height))
 
     def block_header(self, key):
         return self.cache.get(("hdr", key), 30, lambda: self.rpc.call("getblockheader", key))
@@ -298,31 +420,81 @@ class Explorer:
         body = "<h1>Transaction</h1>%s<h2>Inputs and outputs</h2>%s" % (kv(rows), self.tx_card(t))
         return page("Transaction " + short(t["txid"]), body)
 
-    def address(self, addr):
+    def address_data(self, addr, pg):
         if not ADDR.match(addr):
             raise RpcError(-8, "invalid address")
-        valid = self.rpc.call("validateaddress", addr)
-        if not valid["isvalid"]:
+        if not self.rpc.call("validateaddress", addr)["isvalid"]:
             raise RpcError(-5, "Not a valid %s address." % TICKER)
+        conn = self.db()
+        try:
+            row = conn.execute("SELECT balance, txs FROM balances WHERE address=?", (addr,)).fetchone() or (0, 0)
+            hist = conn.execute("SELECT height, txid, delta FROM txio WHERE address=? ORDER BY height DESC, rowid DESC LIMIT ? OFFSET ?",
+                                (addr, PAGE_TXS, (pg - 1) * PAGE_TXS)).fetchall()
+        finally:
+            conn.close()
+        return {"address": addr, "balance": from_sats(row[0]), "txcount": row[1], "page": pg,
+                "history": [{"height": h, "txid": t, "change": from_sats(d)} for h, t, d in hist]}
 
-        def scan():
-            with self.scan_lock:  # scantxoutset allows one scan at a time
-                return self.rpc.call("scantxoutset", "start", ["addr(%s)" % addr])
-        res = self.cache.get(("addr", addr), 60, scan)
-        utxos = sorted(res.get("unspents", []), key=lambda u: -u["height"])
-        rows = [("Address", '<span class=mono>%s</span>' % esc(addr)),
-                ("Balance", amount(res["total_amount"])),
-                ("Unspent outputs", len(utxos)),
-                ("Scanned at height", "{:,}".format(res.get("height", 0)))]
-        trs = "".join("<tr><td>%s:%d</td><td>%s</td><td class=num>%s</td></tr>" % (
-            link_tx(u["txid"]), u["vout"], link_block(self.rpc.call("getblockhash", u["height"]), str(u["height"])), esc(amount(u["amount"])))
-            for u in utxos[:200])
-        body = "<h1>Address</h1>%s<h2>Unspent outputs</h2><table class=list><tr><th>Output</th><th>Height</th><th class=num>Amount</th></tr>%s</table>" % (
-            kv(rows), trs or "<tr><td colspan=3 class=mut>None</td></tr>")
-        body += "<p class=mut>Balances come from the node's UTXO set. Spent history is not indexed.</p>"
-        if len(utxos) > 200:
-            body += "<p class=mut>Showing the 200 newest of %d outputs.</p>" % len(utxos)
+    def address(self, addr, pg):
+        d = self.address_data(addr, pg)
+        pages = max(1, (d["txcount"] + PAGE_TXS - 1) // PAGE_TXS)
+        rows = [("Address", '<span class=mono>%s</span>' % esc(addr)), ("Balance", amount(d["balance"])),
+                ("Transactions", "{:,}".format(d["txcount"]))]
+        trs = "".join("<tr><td>%s</td><td>%s</td><td class=num>%s%s</td></tr>" % (
+            link_block(str(x["height"])), link_tx(x["txid"]), "+" if x["change"] > 0 else "", esc(amount(x["change"])))
+            for x in d["history"])
+        body = "<h1>Address</h1>%s%s<h2>History</h2><table class=list><tr><th>Block</th><th>Transaction</th><th class=num>Change</th></tr>%s</table>" % (
+            kv(rows), self.index_note(), trs or "<tr><td colspan=3 class=mut>No activity</td></tr>")
+        if pages > 1:
+            prev = '<a href="/address/%s?page=%d">← Newer</a>' % (esc(addr), pg - 1) if pg > 1 else "<span></span>"
+            nxt = '<a href="/address/%s?page=%d">Older →</a>' % (esc(addr), pg + 1) if pg < pages else "<span></span>"
+            body += '<div class=pager>%s<span class=mut>Page %d of %d</span>%s</div>' % (prev, pg, pages, nxt)
         return page("Address " + short(addr), body)
+
+    def mempool_data(self):
+        info = self.rpc.call("getmempoolinfo")
+        pool = self.rpc.call("getrawmempool", True)
+        txs = sorted(({"txid": k, "vsize": v["vsize"], "fee": v["fees"]["base"], "time": v["time"]} for k, v in pool.items()),
+                     key=lambda t: -t["time"])
+        return {"count": info["size"], "bytes": info["bytes"], "txs": txs[:100]}
+
+    def mempool(self):
+        d = self.mempool_data()
+        rows = "".join("<tr><td>%s</td><td>%s</td><td class=num>%d</td><td class=num>%s</td></tr>" % (
+            link_tx(t["txid"]), esc(ago(t["time"])), t["vsize"], esc(amount(t["fee"]))) for t in d["txs"])
+        body = ("<h1>Mempool</h1><div class=cards><div class=card><div class=k>Transactions</div><div class=v>%d</div></div>"
+                "<div class=card><div class=k>Size</div><div class=v>%s bytes</div></div></div>") % (d["count"], "{:,}".format(d["bytes"]))
+        body += "<table class=list><tr><th>Transaction</th><th>Seen</th><th class=num>vsize</th><th class=num>Fee</th></tr>%s</table>" % (
+            rows or "<tr><td colspan=4 class=mut>Empty</td></tr>")
+        return page("Mempool", body)
+
+    def richlist_data(self):
+        conn = self.db()
+        try:
+            top = conn.execute("SELECT address, balance FROM balances WHERE balance>0 ORDER BY balance DESC LIMIT 100").fetchall()
+            total = conn.execute("SELECT COALESCE(SUM(balance),0) FROM balances").fetchone()[0]
+        finally:
+            conn.close()
+        return {"total": from_sats(total), "addresses": [{"address": a, "balance": from_sats(b)} for a, b in top]}
+
+    def richlist(self):
+        d = self.richlist_data()
+        total = d["total"]
+        rows = "".join("<tr><td>%d</td><td>%s</td><td class=num>%s</td><td class=num>%s%%</td></tr>" % (
+            i, link_addr(x["address"]), esc(amount(x["balance"])), "%.2f" % (x["balance"] / total * 100 if total else 0))
+            for i, x in enumerate(d["addresses"], 1))
+        body = "<h1>Richlist</h1>%s<p class=mut>Top 100 addresses by balance, as a share of coins held at addresses (%s).</p>" % (
+            self.index_note(), esc(amount(total)))
+        body += "<table class=list><tr><th>#</th><th>Address</th><th class=num>Balance</th><th class=num>Share</th></tr>%s</table>" % rows
+        return page("Richlist", body)
+
+    def info_data(self):
+        info = self.rpc.call("getblockchaininfo")
+        mining = self.cache.get("mining", 30, lambda: self.rpc.call("getmininginfo"))
+        return {"chain": info["chain"], "height": info["blocks"], "bestblockhash": info["bestblockhash"],
+                "difficulty": info["difficulty"], "networkhashps": mining.get("networkhashps", 0),
+                "peers": self.rpc.call("getconnectioncount"), "initialblockdownload": info.get("initialblockdownload", False),
+                "indexed_height": self.indexer.indexed_height}
 
     def search(self, q):
         q = q.strip()
@@ -339,6 +511,11 @@ class Explorer:
         raise RpcError(-8, "Nothing matches that. Try a block height, block hash, txid or address.")
 
 
+def page_arg(qs):
+    v = qs.get("page", ["1"])[0]
+    return max(1, int(v)) if v.isdigit() and len(v) < 7 else 1
+
+
 def make_handler(ex):
     class Handler(BaseHTTPRequestHandler):
         def send(self, code, body, ctype="text/html; charset=utf-8", extra=None):
@@ -353,20 +530,46 @@ def make_handler(ex):
             self.end_headers()
             self.wfile.write(data)
 
+        def api(self, parts, qs):
+            def out(code, obj):
+                self.send(code, json.dumps(obj, default=float), "application/json",
+                          {"Access-Control-Allow-Origin": "*"})
+            try:
+                if parts == ["info"]:
+                    return out(200, ex.info_data())
+                if parts == ["mempool"]:
+                    return out(200, ex.mempool_data())
+                if parts == ["richlist"]:
+                    return out(200, ex.richlist_data())
+                if len(parts) == 2 and parts[0] == "block":
+                    return out(200, ex.rpc.call("getblock", ex.resolve_block(parts[1]), 1))
+                if len(parts) == 2 and parts[0] == "tx" and HEX64.match(parts[1]):
+                    return out(200, ex.rpc.call("getrawtransaction", parts[1], 2))
+                if len(parts) == 2 and parts[0] == "address":
+                    return out(200, ex.address_data(parts[1], page_arg(qs)))
+                out(404, {"error": "unknown API endpoint"})
+            except RpcError as e:
+                out(404 if e.code in (-5, -8) else 502, {"error": str(e)})
+
         def do_GET(self):
             u = urllib.parse.urlparse(self.path)
             qs = urllib.parse.parse_qs(u.query)
             parts = [urllib.parse.unquote(p) for p in u.path.strip("/").split("/")]
             try:
+                if parts[0] == "api":
+                    return self.api(parts[1:], qs)
                 if u.path == "/":
                     return self.send(200, ex.home())
                 if parts[0] == "block" and len(parts) == 2:
-                    pg = int(qs.get("page", ["1"])[0]) if qs.get("page", ["1"])[0].isdigit() else 1
-                    return self.send(200, ex.block(parts[1], pg))
+                    return self.send(200, ex.block(parts[1], page_arg(qs)))
                 if parts[0] == "tx" and len(parts) == 2:
                     return self.send(200, ex.tx(parts[1]))
                 if parts[0] == "address" and len(parts) == 2:
-                    return self.send(200, ex.address(parts[1]))
+                    return self.send(200, ex.address(parts[1], page_arg(qs)))
+                if u.path == "/mempool":
+                    return self.send(200, ex.mempool())
+                if u.path == "/richlist":
+                    return self.send(200, ex.richlist())
                 if parts[0] == "search":
                     return self.send(302, "", extra={"Location": ex.search(qs.get("q", [""])[0])})
                 self.send(404, page("Not found", '<div class=err>Page not found.</div>'))
@@ -408,10 +611,14 @@ def main():
     p.add_argument("--rpcuser")
     p.add_argument("--rpcpassword")
     p.add_argument("--datadir", default=default_datadir(), help="used to find .cookie when no rpcuser/rpcpassword is given")
+    p.add_argument("--db", default=os.environ.get("CLC2_EXPLORER_DB", "explorer.db"), help="SQLite address index file")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8080)
     args = p.parse_args()
-    ex = Explorer(Rpc(args.rpc_url, make_auth(args)))
+    rpc = Rpc(args.rpc_url, make_auth(args))
+    indexer = Indexer(rpc, args.db)
+    indexer.start()
+    ex = Explorer(rpc, indexer)
     srv = ThreadingHTTPServer((args.host, args.port), make_handler(ex))
     print("Explorer on http://%s:%d/ (node %s)" % (args.host, args.port, args.rpc_url))
     try:

@@ -1,0 +1,21 @@
+[Unit]
+Description=CoiledCoin II block explorer
+After=network-online.target coiledcoin2d.service
+Wants=network-online.target
+
+[Service]
+User=clc2
+WorkingDirectory=/opt/clc2-explorer
+# CLC2_RPC_USER and CLC2_RPC_PASSWORD go in the env file; omit them if the user can read the node's .cookie
+EnvironmentFile=-/etc/clc2-explorer.env
+ExecStart=/usr/bin/python3 -I /opt/clc2-explorer/explorer.py --db /var/lib/clc2-explorer/explorer.db --port 8080
+Restart=on-failure
+RestartSec=5
+StateDirectory=clc2-explorer
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
