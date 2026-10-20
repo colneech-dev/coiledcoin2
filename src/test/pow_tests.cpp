@@ -2,6 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <arith_uint256.h>
 #include <chain.h>
 #include <chainparams.h>
 #include <pow.h>
@@ -11,14 +12,58 @@
 #include <util/chaintype.h>
 #include <validation.h>
 
+#include <vector>
+
 #include <boost/test/unit_test.hpp>
 
 BOOST_FIXTURE_TEST_SUITE(pow_tests, BasicTestingSetup)
 
+/** Bitcoin's retargeting rules, for the tests below that use Bitcoin mainnet block data.
+ *  CoiledCoin II mainnet uses LWMA instead. */
+static Consensus::Params BitcoinRetargetParams(const Consensus::Params& base)
+{
+    Consensus::Params p{base};
+    p.fLWMA = false;
+    p.fPowAllowMinDifficultyBlocks = false;
+    p.fPowNoRetargeting = false;
+    p.enforce_BIP94 = false;
+    p.nPowTargetTimespan = 14 * 24 * 60 * 60;
+    p.nPowTargetSpacing = 10 * 60;
+    p.powLimit = uint256{"00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
+    return p;
+}
+
+/** A chain of n blocks with fixed spacing and nBits. */
+static std::vector<CBlockIndex> MakeChain(int n, int64_t spacing, uint32_t nBits)
+{
+    std::vector<CBlockIndex> chain(n);
+    for (int i = 0; i < n; ++i) {
+        chain[i].nHeight = i;
+        chain[i].pprev = i ? &chain[i - 1] : nullptr;
+        chain[i].nTime = 1800000000 + i * spacing;
+        chain[i].nBits = nBits;
+    }
+    return chain;
+}
+
+static arith_uint256 Target(uint32_t nBits)
+{
+    arith_uint256 t;
+    t.SetCompact(nBits);
+    return t;
+}
+
+/** True if a is within 0.2% of b. */
+static bool Near(const arith_uint256& a, const arith_uint256& b)
+{
+    const arith_uint256 tol = b / 500;
+    return a <= b + tol && a + tol >= b;
+}
+
 /* Test calculation of next difficulty target with no constraints applying */
 BOOST_AUTO_TEST_CASE(get_next_work)
 {
-    const auto chainParams = CreateChainParams(*m_node.args, ChainType::MAIN);
+    const auto consensus = BitcoinRetargetParams(CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus());
     int64_t nLastRetargetTime = 1261130161; // Block #30240
     CBlockIndex pindexLast;
     pindexLast.nHeight = 32255;
@@ -30,56 +75,56 @@ BOOST_AUTO_TEST_CASE(get_next_work)
     // reimplementing the same code that is written in pow.cpp. Rather than
     // copy that code, we just hardcode the expected result.
     unsigned int expected_nbits = 0x1d00d86aU;
-    BOOST_CHECK_EQUAL(CalculateNextWorkRequired(&pindexLast, nLastRetargetTime, chainParams->GetConsensus()), expected_nbits);
-    BOOST_CHECK(PermittedDifficultyTransition(chainParams->GetConsensus(), pindexLast.nHeight+1, pindexLast.nBits, expected_nbits));
+    BOOST_CHECK_EQUAL(CalculateNextWorkRequired(&pindexLast, nLastRetargetTime, consensus), expected_nbits);
+    BOOST_CHECK(PermittedDifficultyTransition(consensus, pindexLast.nHeight+1, pindexLast.nBits, expected_nbits));
 }
 
 /* Test the constraint on the upper bound for next work */
 BOOST_AUTO_TEST_CASE(get_next_work_pow_limit)
 {
-    const auto chainParams = CreateChainParams(*m_node.args, ChainType::MAIN);
+    const auto consensus = BitcoinRetargetParams(CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus());
     int64_t nLastRetargetTime = 1231006505; // Block #0
     CBlockIndex pindexLast;
     pindexLast.nHeight = 2015;
     pindexLast.nTime = 1233061996;  // Block #2015
     pindexLast.nBits = 0x1d00ffff;
     unsigned int expected_nbits = 0x1d00ffffU;
-    BOOST_CHECK_EQUAL(CalculateNextWorkRequired(&pindexLast, nLastRetargetTime, chainParams->GetConsensus()), expected_nbits);
-    BOOST_CHECK(PermittedDifficultyTransition(chainParams->GetConsensus(), pindexLast.nHeight+1, pindexLast.nBits, expected_nbits));
+    BOOST_CHECK_EQUAL(CalculateNextWorkRequired(&pindexLast, nLastRetargetTime, consensus), expected_nbits);
+    BOOST_CHECK(PermittedDifficultyTransition(consensus, pindexLast.nHeight+1, pindexLast.nBits, expected_nbits));
 }
 
 /* Test the constraint on the lower bound for actual time taken */
 BOOST_AUTO_TEST_CASE(get_next_work_lower_limit_actual)
 {
-    const auto chainParams = CreateChainParams(*m_node.args, ChainType::MAIN);
+    const auto consensus = BitcoinRetargetParams(CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus());
     int64_t nLastRetargetTime = 1279008237; // Block #66528
     CBlockIndex pindexLast;
     pindexLast.nHeight = 68543;
     pindexLast.nTime = 1279297671;  // Block #68543
     pindexLast.nBits = 0x1c05a3f4;
     unsigned int expected_nbits = 0x1c0168fdU;
-    BOOST_CHECK_EQUAL(CalculateNextWorkRequired(&pindexLast, nLastRetargetTime, chainParams->GetConsensus()), expected_nbits);
-    BOOST_CHECK(PermittedDifficultyTransition(chainParams->GetConsensus(), pindexLast.nHeight+1, pindexLast.nBits, expected_nbits));
+    BOOST_CHECK_EQUAL(CalculateNextWorkRequired(&pindexLast, nLastRetargetTime, consensus), expected_nbits);
+    BOOST_CHECK(PermittedDifficultyTransition(consensus, pindexLast.nHeight+1, pindexLast.nBits, expected_nbits));
     // Test that reducing nbits further would not be a PermittedDifficultyTransition.
     unsigned int invalid_nbits = expected_nbits-1;
-    BOOST_CHECK(!PermittedDifficultyTransition(chainParams->GetConsensus(), pindexLast.nHeight+1, pindexLast.nBits, invalid_nbits));
+    BOOST_CHECK(!PermittedDifficultyTransition(consensus, pindexLast.nHeight+1, pindexLast.nBits, invalid_nbits));
 }
 
 /* Test the constraint on the upper bound for actual time taken */
 BOOST_AUTO_TEST_CASE(get_next_work_upper_limit_actual)
 {
-    const auto chainParams = CreateChainParams(*m_node.args, ChainType::MAIN);
+    const auto consensus = BitcoinRetargetParams(CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus());
     int64_t nLastRetargetTime = 1263163443; // NOTE: Not an actual block time
     CBlockIndex pindexLast;
     pindexLast.nHeight = 46367;
     pindexLast.nTime = 1269211443;  // Block #46367
     pindexLast.nBits = 0x1c387f6f;
     unsigned int expected_nbits = 0x1d00e1fdU;
-    BOOST_CHECK_EQUAL(CalculateNextWorkRequired(&pindexLast, nLastRetargetTime, chainParams->GetConsensus()), expected_nbits);
-    BOOST_CHECK(PermittedDifficultyTransition(chainParams->GetConsensus(), pindexLast.nHeight+1, pindexLast.nBits, expected_nbits));
+    BOOST_CHECK_EQUAL(CalculateNextWorkRequired(&pindexLast, nLastRetargetTime, consensus), expected_nbits);
+    BOOST_CHECK(PermittedDifficultyTransition(consensus, pindexLast.nHeight+1, pindexLast.nBits, expected_nbits));
     // Test that increasing nbits further would not be a PermittedDifficultyTransition.
     unsigned int invalid_nbits = expected_nbits+1;
-    BOOST_CHECK(!PermittedDifficultyTransition(chainParams->GetConsensus(), pindexLast.nHeight+1, pindexLast.nBits, invalid_nbits));
+    BOOST_CHECK(!PermittedDifficultyTransition(consensus, pindexLast.nHeight+1, pindexLast.nBits, invalid_nbits));
 }
 
 BOOST_AUTO_TEST_CASE(CheckProofOfWork_test_negative_target)
@@ -212,6 +257,64 @@ BOOST_AUTO_TEST_CASE(ChainParams_TESTNET4_sanity)
 BOOST_AUTO_TEST_CASE(ChainParams_SIGNET_sanity)
 {
     sanity_check_chainparams(*m_node.args, ChainType::SIGNET);
+}
+
+BOOST_AUTO_TEST_CASE(lwma_initial_difficulty)
+{
+    const auto& c = CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus();
+    BOOST_REQUIRE(c.fLWMA);
+    // Before the window is full the fixed launch difficulty applies, whatever the blocks say
+    auto chain = MakeChain(c.nLWMAWindow, 1, 0x1d00ffff);
+    CBlockHeader header;
+    BOOST_CHECK_EQUAL(GetNextWorkRequired(&chain.back(), &header, c), c.nInitialBits);
+    BOOST_CHECK_EQUAL(GetNextWorkRequired(&chain.front(), &header, c), c.nInitialBits);
+}
+
+BOOST_AUTO_TEST_CASE(lwma_tracks_solvetime)
+{
+    const auto& c = CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus();
+    const uint32_t bits = c.nInitialBits;
+    const arith_uint256 x = Target(bits);
+    CBlockHeader header;
+
+    // On-target spacing leaves the target unchanged
+    auto steady = MakeChain(200, c.nPowTargetSpacing, bits);
+    BOOST_CHECK(Near(Target(GetNextWorkRequired(&steady.back(), &header, c)), x));
+
+    // Twice as fast: target halves (difficulty doubles)
+    auto fast = MakeChain(200, c.nPowTargetSpacing / 2, bits);
+    BOOST_CHECK(Near(Target(GetNextWorkRequired(&fast.back(), &header, c)), x / 2));
+
+    // Twice as slow: target doubles
+    auto slow = MakeChain(200, c.nPowTargetSpacing * 2, bits);
+    BOOST_CHECK(Near(Target(GetNextWorkRequired(&slow.back(), &header, c)), x * 2));
+
+    // Very slow blocks are clamped to 6x the target spacing, so the target rises at most 6x
+    auto stalled = MakeChain(200, c.nPowTargetSpacing * 100, bits);
+    BOOST_CHECK(Near(Target(GetNextWorkRequired(&stalled.back(), &header, c)), x * 6));
+}
+
+BOOST_AUTO_TEST_CASE(lwma_pow_limit)
+{
+    const auto& c = CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus();
+    const uint32_t limit_bits = UintToArith256(c.powLimit).GetCompact();
+    CBlockHeader header;
+    // Slow blocks at the minimum difficulty cannot push the target above powLimit
+    auto chain = MakeChain(200, c.nPowTargetSpacing * 100, limit_bits);
+    BOOST_CHECK_EQUAL(GetNextWorkRequired(&chain.back(), &header, c), limit_bits);
+}
+
+BOOST_AUTO_TEST_CASE(lwma_non_monotonic_timestamps)
+{
+    const auto& c = CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus();
+    // Out-of-order timestamps are treated as a 1 second solvetime, so they never make the target
+    // easier than a chain of 1-second blocks would
+    auto chain = MakeChain(200, c.nPowTargetSpacing, c.nInitialBits);
+    for (size_t i = 100; i < chain.size(); ++i) chain[i].nTime = chain[99].nTime;
+    CBlockHeader header;
+    const arith_uint256 got = Target(GetNextWorkRequired(&chain.back(), &header, c));
+    BOOST_CHECK(got < Target(c.nInitialBits));
+    BOOST_CHECK(got > 0);
 }
 
 BOOST_AUTO_TEST_CASE(block_subsidy_main)

@@ -557,7 +557,7 @@ public:
         consensus.nPowTargetSpacing = 10 * 60;
         consensus.fPowAllowMinDifficultyBlocks = true;
         consensus.enforce_BIP94 = opts.enforce_bip94;
-        consensus.fPowNoRetargeting = false; // CoiledCoin II test: exercise LWMA on regtest
+        consensus.fPowNoRetargeting = true; // as Bitcoin regtest: blocks are mined instantly, LWMA would make the target unreachable (LWMA is covered by pow_tests)
 
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].bit = 28;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nStartTime = 0;
